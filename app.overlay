@@ -18,8 +18,18 @@
 		};
 	};
 
+	/* BQ25120A CD (Charge Disable) pin - drive LOW to enable charging */
+	bq25120a_cd: bq25120a_cd {
+		compatible = "gpio-leds";
+		bq25120a_cd_pin: bq25120a_cd_pin {
+			gpios = <&gpio0 12 GPIO_ACTIVE_HIGH>;
+			label = "BQ25120A Charge Disable";
+		};
+	};
+
 	aliases {
 		maxm86161-ldo-en = &maxm86161_ldo_en;
+		bq25120a-cd = &bq25120a_cd_pin;
 	};
 };
 

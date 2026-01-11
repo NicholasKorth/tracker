@@ -67,6 +67,7 @@ static struct k_work adv_work;
 static const struct device *imu_dev = DEVICE_DT_GET_ONE(st_lsm6dsv16x);
 static const struct device *i2c_dev = DEVICE_DT_GET(DT_NODELABEL(i2c0));
 static const struct gpio_dt_spec maxm86161_ldo = GPIO_DT_SPEC_GET_OR(DT_ALIAS(maxm86161_ldo_en), gpios, {0});
+static const struct gpio_dt_spec bq25120a_cd = GPIO_DT_SPEC_GET_OR(DT_ALIAS(bq25120a_cd), gpios, {0});
 static bool imu_ready = false;
 static bool uart_ready = false;
 
@@ -1377,6 +1378,38 @@ static int bq25120a_init(void)
 	printk("*       BQ25120A CHARGER INIT START       *\n");
 	printk("********************************************\n");
 
+	/* Drive CD (Charge Disable) pin LOW to enable charging */
+	if (gpio_is_ready_dt(&bq25120a_cd)) {
+		err = gpio_pin_configure_dt(&bq25120a_cd, GPIO_OUTPUT_INACTIVE);
+		if (err) {
+			LOG_ERR("BQ25120A: Failed to configure CD pin (err %d)", err);
+		} else {
+			gpio_pin_set_dt(&bq25120a_cd, 0);  /* Drive LOW to enable charging */
+			printk("BQ25120A: CD pin driven LOW (charging enabled)\n");
+		}
+	} else {
+		LOG_WRN("BQ25120A: CD GPIO not ready");
+		printk("BQ25120A: WARNING - CD GPIO not ready, charging may be disabled!\n");
+	}
+	k_msleep(5);
+
+	/* CRITICAL: Set BUVLO threshold FIRST before reading any status
+	 * to prevent BAT_UVLO fault from latching when battery is below default 3.0V.
+	 * Register 0x09: ILIM_UVLO_CTRL (reset state: 0x0A)
+	 * B7: RESET (write 1 resets all regs - DO NOT SET!)
+	 * B6: Reserved
+	 * B5:B3 = INLIM[2:0]: I = 50mA + CODE*50mA (101 = 300mA)
+	 * B2:B0 = BUVLO[2:0]: 010=3.0V, 011=2.8V, 100=2.6V, 101=2.4V, 110/111=2.2V
+	 * Set to 0x2D: INLIM=300mA (101), BUVLO=2.4V (101)
+	 */
+	err = i2c_reg_write(BQ25120A_I2C_ADDR, BQ25120A_REG_ILIM_UVLO_CTRL, 0x2D);
+	if (err) {
+		LOG_WRN("BQ25120A: Failed to set BUVLO threshold early");
+	} else {
+		printk("BQ25120A: BUVLO threshold set to 2.4V (before status read)\n");
+	}
+	k_msleep(5);
+
 	/* Read status register to verify communication */
 	err = i2c_reg_read(BQ25120A_I2C_ADDR, BQ25120A_REG_STATUS, &status);
 	if (err) {
@@ -1386,21 +1419,19 @@ static int bq25120a_init(void)
 
 	printk("BQ25120A Status: 0x%02X\n", status);
 	printk("  - Charge state: %s\n", bq25120a_get_charge_status(status));
-	printk("  - VIN_PG (USB power): %s\n", (status & 0x20) ? "GOOD" : "NOT PRESENT");
+	printk("  - VINDPM active: %s\n", (status & 0x04) ? "YES" : "NO");
+	printk("  - CD pin (charge disable): %s\n", (status & 0x02) ? "HIGH (DISABLED!)" : "LOW (enabled)");
+	printk("  - SYS output: %s\n", (status & 0x01) ? "ENABLED" : "DISABLED");
 	LOG_INF("BQ25120A Status: 0x%02X", status);
 
 	/* Read faults register */
 	err = i2c_reg_read(BQ25120A_I2C_ADDR, BQ25120A_REG_FAULTS, &faults);
 	printk("BQ25120A Faults: 0x%02X\n", faults);
-	if (faults != 0) {
+	if (faults & 0xF0) {  /* Only upper 4 bits are fault flags */
 		if (faults & 0x80) printk("  - VIN_OV (input overvoltage)\n");
 		if (faults & 0x40) printk("  - VIN_UV (input undervoltage)\n");
 		if (faults & 0x20) printk("  - BAT_UVLO (battery undervoltage)\n");
 		if (faults & 0x10) printk("  - BAT_OCP (battery overcurrent)\n");
-		if (faults & 0x08) printk("  - VIN_OV_TRACK\n");
-		if (faults & 0x04) printk("  - TS_FAULT (temperature sensor)\n");
-		if (faults & 0x02) printk("  - TIMER_FAULT\n");
-		if (faults & 0x01) printk("  - PG_STAT (power not good)\n");
 	}
 
 	/* Disable TS (temperature sensor) function if no thermistor connected
@@ -1498,24 +1529,18 @@ static int bq25120a_init(void)
 		printk("BQ25120A: VIN_DPM set to 4.2V threshold\n");
 	}
 
-	/* Configure input current limit and UVLO
+	/* Re-apply ILIM/UVLO settings (already set at init start, but confirm here)
 	 * Register 0x09: ILIM_UVLO_CTRL
-	 * Bits [7:5] = ILIM: input current limit
-	 *   000 = 50mA, 001 = 100mA, 010 = 150mA, 011 = 200mA
-	 *   100 = 300mA, 101 = 400mA, 110 = 500mA
-	 * Bits [4:1] = UVLO threshold (battery under-voltage lockout)
-	 *   0000 = 2.2V, each step +100mV
-	 *   For 2.4V: (2400 - 2200) / 100 = 2 -> 0x04 (shifted)
-	 * Bit [0] = BUVLO_DIS: 1 = UVLO disabled (allows charging depleted battery)
-	 *
-	 * Set ILIM=300mA (0x80), UVLO=2.4V (0x04), BUVLO disabled to allow charging
-	 * 0x80 | 0x04 | 0x01 = 0x85
+	 * B7: RESET (DO NOT SET - resets all registers!)
+	 * B5:B3 = INLIM: 50mA + CODE*50mA (101 = 300mA)
+	 * B2:B0 = BUVLO: 101 = 2.4V
+	 * Value 0x2D = 0b00101101
 	 */
-	err = i2c_reg_write(BQ25120A_I2C_ADDR, BQ25120A_REG_ILIM_UVLO_CTRL, 0x85);
+	err = i2c_reg_write(BQ25120A_I2C_ADDR, BQ25120A_REG_ILIM_UVLO_CTRL, 0x2D);
 	if (err) {
 		LOG_WRN("BQ25120A: Failed to set ILIM/UVLO");
 	} else {
-		printk("BQ25120A: ILIM=300mA, UVLO disabled\n");
+		printk("BQ25120A: ILIM=300mA, BUVLO=2.4V\n");
 	}
 
 	/* Read back status to confirm */
@@ -1530,7 +1555,7 @@ static int bq25120a_init(void)
 	uint8_t ilim_uvlo;
 	err = i2c_reg_read(BQ25120A_I2C_ADDR, BQ25120A_REG_ILIM_UVLO_CTRL, &ilim_uvlo);
 	if (err == 0) {
-		printk("BQ25120A ILIM_UVLO_CTRL: 0x%02X (expected 0x85)\n", ilim_uvlo);
+		printk("BQ25120A ILIM_UVLO_CTRL: 0x%02X (expected 0x2D)\n", ilim_uvlo);
 	}
 
 	/* Toggle charge enable to clear fault state
