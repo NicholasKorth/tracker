@@ -1,0 +1,31 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cat:*)",
+      "Bash(findstr:*)",
+      "Bash(dir:*)",
+      "Bash(west build:*)",
+      "Bash(cmd /c \"dir c:\\\\Users\\\\korth\\\\peripheral_uart\\\\build\")",
+      "Bash(pip show:*)",
+      "Bash(pip install:*)",
+      "Bash(winget install:*)",
+      "Bash(choco install:*)",
+      "Bash(wmic:*)",
+      "Bash(mode)",
+      "Bash(cmd /c \"mode\")",
+      "Bash(cmd /c \"pnputil /enum-devices /class USB\")",
+      "Bash(powershell -Command \"Get-WmiObject Win32_SerialPort | Select-Object DeviceID, Caption, Description\")",
+      "Bash(powershell:*)",
+      "Bash(C:ncstoolchains66cdf9b75enrfutilbinnrfutil.exe --help)",
+      "Bash(cmd /c \"C:\\\\ncs\\\\toolchains\\\\66cdf9b75e\\\\nrfutil\\\\bin\\\\nrfutil.exe --help\")",
+      "Bash(cmd /c \"cd C:\\\\Users\\\\korth && tar -xf dfu-util-0.11-binaries.tar.xz\")",
+      "Bash(cmd /c \"c:\\\\Users\\\\korth\\\\peripheral_uart\\\\build_project.bat\")",
+      "Bash(cmd /c:*)",
+      "Bash(gh auth status:*)",
+      "Bash(where:*)",
+      "Bash(git config:*)",
+      "Bash(git remote add:*)",
+      "Bash(git add:*)"
+    ]
+  }
+}

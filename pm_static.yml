@@ -1,0 +1,27 @@
+# Partition Manager static configuration for nRF52840 with MCUboot + USB DFU
+# Total flash: 1MB (0x100000)
+# Layout: MCUboot bootloader (64KB for USB stack) + padding + primary slot + secondary slot + settings
+
+mcuboot:
+  address: 0x0
+  size: 0x10000
+  region: flash_primary
+
+mcuboot_pad:
+  address: 0x10000
+  size: 0x200
+  region: flash_primary
+
+# Primary slot: 0x10200 to 0x80200 (448KB - 16KB = 432KB)
+# The partition manager will automatically place the app partition here
+
+mcuboot_secondary:
+  address: 0x80200
+  size: 0x6C000
+  region: flash_primary
+
+# Settings storage at the very end of flash
+settings_storage:
+  address: 0xEC200
+  size: 0x13E00
+  region: flash_primary

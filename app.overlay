@@ -1,0 +1,87 @@
+/*
+ * Copyright (c) 2022 Nordic Semiconductor ASA
+ *
+ * SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
+ */
+
+/ {
+	chosen {
+		nordic,nus-uart = &uart0;
+	};
+
+	/* MAXM86161 LDO enable GPIO */
+	maxm86161_ldo: maxm86161_ldo {
+		compatible = "gpio-leds";
+		maxm86161_ldo_en: maxm86161_ldo_en {
+			gpios = <&gpio1 3 GPIO_ACTIVE_HIGH>;
+			label = "MAXM86161 LDO Enable";
+		};
+	};
+
+	aliases {
+		maxm86161-ldo-en = &maxm86161_ldo_en;
+	};
+};
+
+
+&spi1 {
+	compatible = "nordic,nrf-spi";
+	status = "okay";
+	cs-gpios = <&gpio0 28 GPIO_ACTIVE_LOW>;
+
+	pinctrl-0 = <&spi1_default>;
+	pinctrl-1 = <&spi1_sleep>;
+	pinctrl-names = "default", "sleep";
+
+	lsm6dsv16x: lsm6dsv16x@0 {
+		compatible = "st,lsm6dsv16x";
+		reg = <0>;
+		spi-max-frequency = <8000000>;
+		int1-gpios = <&gpio0 3 GPIO_ACTIVE_HIGH>;
+	};
+};
+
+&i2c0 {
+	compatible = "nordic,nrf-twim";
+	status = "okay";
+
+	pinctrl-0 = <&i2c0_default>;
+	pinctrl-1 = <&i2c0_sleep>;
+	pinctrl-names = "default", "sleep";
+};
+
+&pinctrl {
+	i2c0_default: i2c0_default {
+		group1 {
+			psels = <NRF_PSEL(TWIM_SDA, 0, 26)>,
+				<NRF_PSEL(TWIM_SCL, 0, 27)>;
+			bias-pull-up;
+		};
+	};
+
+	i2c0_sleep: i2c0_sleep {
+		group1 {
+			psels = <NRF_PSEL(TWIM_SDA, 0, 26)>,
+				<NRF_PSEL(TWIM_SCL, 0, 27)>;
+			low-power-enable;
+			bias-pull-up;
+		};
+	};
+
+	spi1_default: spi1_default {
+		group1 {
+			psels = <NRF_PSEL(SPIM_SCK, 0, 29)>,
+				<NRF_PSEL(SPIM_MOSI, 0, 30)>,
+				<NRF_PSEL(SPIM_MISO, 0, 31)>;
+		};
+	};
+
+	spi1_sleep: spi1_sleep {
+		group1 {
+			psels = <NRF_PSEL(SPIM_SCK, 0, 29)>,
+				<NRF_PSEL(SPIM_MOSI, 0, 30)>,
+				<NRF_PSEL(SPIM_MISO, 0, 31)>;
+			low-power-enable;
+		};
+	};
+};

@@ -1,0 +1,15 @@
+/* MCUboot overlay for custom PCB - USB DFU GPIO trigger on P0.02 */
+
+/ {
+	aliases {
+		mcuboot-button0 = &button0;
+	};
+
+	buttons {
+		compatible = "gpio-keys";
+		button0: button_0 {
+			gpios = <&gpio0 2 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
+			label = "DFU Button (P0.02)";
+		};
+	};
+};
