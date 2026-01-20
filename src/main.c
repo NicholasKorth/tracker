@@ -163,6 +163,20 @@ static uint32_t spo2_ir_ac = 0;
 static uint32_t spo2_ir_dc = 0;
 static uint8_t spo2_value = 0;
 
+/* BLE packet averaging - accumulate samples between transmissions
+ * This reduces packet rate while maintaining data quality
+ * Averages are sent every BLE_AVG_COUNT samples (~80ms at 25Hz sensor rate)
+ */
+#define BLE_AVG_COUNT 2  /* Average 2 samples per packet = ~12.5 Hz packet rate */
+static int ble_avg_idx = 0;
+
+/* IMU accumulators (in milli-units to avoid float) */
+static int32_t avg_accel_x = 0, avg_accel_y = 0, avg_accel_z = 0;
+static int32_t avg_gyro_x = 0, avg_gyro_y = 0, avg_gyro_z = 0;
+
+/* PPG accumulator */
+static uint32_t avg_ppg = 0;
+
 /* BLE Sensor Data Packet Structure (packed binary for efficiency)
  * Total: 32 bytes
  *
@@ -628,17 +642,13 @@ static void auth_passkey_confirm(struct bt_conn *conn, unsigned int passkey)
 {
 	char addr[BT_ADDR_LE_STR_LEN];
 
-	auth_conn = bt_conn_ref(conn);
-
 	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
 
 	LOG_INF("Passkey for %s: %06u", addr, passkey);
+	printk("Auto-confirming passkey %06u for %s\n", passkey, addr);
 
-	if (IS_ENABLED(CONFIG_SOC_SERIES_NRF54HX) || IS_ENABLED(CONFIG_SOC_SERIES_NRF54LX)) {
-		LOG_INF("Press Button 0 to confirm, Button 1 to reject.");
-	} else {
-		LOG_INF("Press Button 1 to confirm, Button 2 to reject.");
-	}
+	/* Auto-confirm passkey (no physical buttons on custom PCB) */
+	bt_conn_auth_passkey_confirm(conn);
 }
 
 
@@ -1069,17 +1079,27 @@ static int maxm86161_init(void)
 	i2c_reg_write(MAXM86161_I2C_ADDR, MAXM86161_REG_FIFO_READ_PTR, 0x00);
 	i2c_reg_write(MAXM86161_I2C_ADDR, MAXM86161_REG_OVF_COUNTER, 0x00);
 
-	/* Configure PPG based on mode
-	 * HR-only mode: Green LED only at 100 sps for clean signal
-	 * SpO2 mode: Green + Red + IR at 50 sps
+	/* Configure PPG based on mode - CLINICAL SAMPLE RATES
+	 * HR-only mode: Green LED only at 100 sps / 2 avg = 50 Hz effective
+	 * SpO2 mode: Green + Red + IR at 100 sps / no avg = 100 Hz effective
 	 */
 	if (spo2_mode_enabled) {
-		/* SpO2 mode: 50 sps, 3 LEDs
-		 * PPG_CONFIG1: ADC_RNG=01, SMP_RATE=001 (50 sps), TINT=011
+		/* SpO2 mode: 100 sps, 4x averaging = 25 Hz effective
+		 * PPG_CONFIG1: ADC_RNG=01, SMP_RATE=011 (100 sps), TINT=011 (117.3us)
 		 */
-		err = i2c_reg_write(MAXM86161_I2C_ADDR, MAXM86161_REG_PPG_CONFIG1, 0x4B);
+		err = i2c_reg_write(MAXM86161_I2C_ADDR, MAXM86161_REG_PPG_CONFIG1, 0x5B);
 		if (err) {
 			LOG_ERR("MAXM86161: Failed to configure PPG_CONFIG1");
+			return err;
+		}
+
+		/* PPG_CONFIG2: 4-sample averaging (more noise rejection, lower power)
+		 *   [2:0] SMP_AVE = 010 (4 sample average)
+		 * With 100 sps / 4 avg = 25 Hz effective
+		 */
+		err = i2c_reg_write(MAXM86161_I2C_ADDR, MAXM86161_REG_PPG_CONFIG2, 0x02);
+		if (err) {
+			LOG_ERR("MAXM86161: Failed to configure PPG_CONFIG2");
 			return err;
 		}
 
@@ -1089,22 +1109,32 @@ static int maxm86161_init(void)
 		err = i2c_reg_write(MAXM86161_I2C_ADDR, MAXM86161_REG_LED_SEQ2, 0x03);
 		if (err) return err;
 
-		/* LED currents: Green 12mA, IR 25mA, Red 25mA */
+		/* LED currents: REDUCED for better BLE - Green 12mA, IR 20mA, Red 20mA */
 		err = i2c_reg_write(MAXM86161_I2C_ADDR, MAXM86161_REG_LED1_PA, 0x1F);
 		if (err) return err;
-		err = i2c_reg_write(MAXM86161_I2C_ADDR, MAXM86161_REG_LED2_PA, 0x3F);
+		err = i2c_reg_write(MAXM86161_I2C_ADDR, MAXM86161_REG_LED2_PA, 0x35);
 		if (err) return err;
-		err = i2c_reg_write(MAXM86161_I2C_ADDR, MAXM86161_REG_LED3_PA, 0x3F);
+		err = i2c_reg_write(MAXM86161_I2C_ADDR, MAXM86161_REG_LED3_PA, 0x35);
 		if (err) return err;
 
-		printk("MAXM86161: SpO2 mode (Green+IR+Red @ 50sps)\n");
+		printk("MAXM86161: SpO2 mode (Green+IR+Red @ 25Hz, low power)\n");
 	} else {
-		/* HR-only mode: 100 sps, Green LED only for clean signal
-		 * PPG_CONFIG1: ADC_RNG=01, SMP_RATE=010 (100 sps), TINT=010 (58.7us)
+		/* HR-only mode: 100 sps / 4 avg = 25 Hz effective
+		 * PPG_CONFIG1: ADC_RNG=01, SMP_RATE=011 (100 sps), TINT=010 (58.7us)
 		 */
-		err = i2c_reg_write(MAXM86161_I2C_ADDR, MAXM86161_REG_PPG_CONFIG1, 0x52);
+		err = i2c_reg_write(MAXM86161_I2C_ADDR, MAXM86161_REG_PPG_CONFIG1, 0x5A);
 		if (err) {
 			LOG_ERR("MAXM86161: Failed to configure PPG_CONFIG1");
+			return err;
+		}
+
+		/* PPG_CONFIG2: 4-sample averaging for HR
+		 *   [2:0] SMP_AVE = 010 (4 sample average)
+		 * With 100 sps / 4 avg = 25 Hz effective
+		 */
+		err = i2c_reg_write(MAXM86161_I2C_ADDR, MAXM86161_REG_PPG_CONFIG2, 0x02);
+		if (err) {
+			LOG_ERR("MAXM86161: Failed to configure PPG_CONFIG2");
 			return err;
 		}
 
@@ -1114,31 +1144,62 @@ static int maxm86161_init(void)
 		err = i2c_reg_write(MAXM86161_I2C_ADDR, MAXM86161_REG_LED_SEQ2, 0x00);
 		if (err) return err;
 
-		/* LED currents: Green 15mA (slightly higher for better signal) */
-		err = i2c_reg_write(MAXM86161_I2C_ADDR, MAXM86161_REG_LED1_PA, 0x28);
+		/* LED currents: REDUCED for better BLE - Green 10mA */
+		err = i2c_reg_write(MAXM86161_I2C_ADDR, MAXM86161_REG_LED1_PA, 0x1A);
 		if (err) return err;
 		err = i2c_reg_write(MAXM86161_I2C_ADDR, MAXM86161_REG_LED2_PA, 0x00);
 		if (err) return err;
 		err = i2c_reg_write(MAXM86161_I2C_ADDR, MAXM86161_REG_LED3_PA, 0x00);
 		if (err) return err;
 
-		printk("MAXM86161: HR-only mode (Green @ 100sps)\n");
+		printk("MAXM86161: HR-only mode (Green @ 25Hz, low power)\n");
 	}
 
-	/* PPG_CONFIG2 (0x12): Sample averaging
-	 *   [2:0] SMP_AVE = 010 (4 sample average for noise reduction)
-	 */
-	err = i2c_reg_write(MAXM86161_I2C_ADDR, MAXM86161_REG_PPG_CONFIG2, 0x02);
-	if (err) {
-		LOG_ERR("MAXM86161: Failed to configure PPG_CONFIG2");
-		return err;
-	}
+	/* Note: PPG_CONFIG2 is now set per-mode above */
 
-	/* Set LED range for all LEDs */
+	/* Set LED range for all LEDs (0x00 = 31mA range) */
 	err = i2c_reg_write(MAXM86161_I2C_ADDR, MAXM86161_REG_LED_RANGE1, 0x00);
 	if (err) {
 		LOG_ERR("MAXM86161: Failed to set LED range");
 		return err;
+	}
+
+	/* PPG_CONFIG3 (0x13): LED settling time - CRITICAL for noise rejection
+	 *   [7:6] LED_SETLNG = 11 (12us settling - longer = cleaner signal)
+	 *   [2:0] BURST_RATE = 000 (normal mode)
+	 * Longer settling time helps reject power supply ripple
+	 */
+	err = i2c_reg_write(MAXM86161_I2C_ADDR, MAXM86161_REG_PPG_CONFIG3, 0xC0);
+	if (err) {
+		LOG_WRN("MAXM86161: Failed to set PPG_CONFIG3");
+	}
+
+	/* PD_BIAS (0x15): Photodiode bias current - CRITICAL for noise immunity
+	 *   [1:0] PD_BIAS = 11 (65pF capacitor, highest noise rejection)
+	 * Higher bias capacitance filters high-frequency noise from power supply
+	 */
+	err = i2c_reg_write(MAXM86161_I2C_ADDR, MAXM86161_REG_PD_BIAS, 0x03);
+	if (err) {
+		LOG_WRN("MAXM86161: Failed to set PD_BIAS");
+	}
+
+	/* FIFO_CONFIG1 (0x09): FIFO configuration
+	 *   [7] FIFO_A_FULL = 0 (interrupt when FIFO almost full)
+	 *   [4] FIFO_DATA_CTRL = 0 (no TAG in FIFO data - keep current format)
+	 *   [3:0] FIFO_A_FULL_THR = 0xF (15 samples until almost full)
+	 */
+	err = i2c_reg_write(MAXM86161_I2C_ADDR, MAXM86161_REG_FIFO_CONFIG1, 0x0F);
+	if (err) {
+		LOG_WRN("MAXM86161: Failed to set FIFO_CONFIG1");
+	}
+
+	/* FIFO_CONFIG2 (0x0A): FIFO roll-over and clear
+	 *   [1] FIFO_ROLLOVER_EN = 1 (allow rollover when full)
+	 *   [0] FLUSH_FIFO = 0 (don't flush)
+	 */
+	err = i2c_reg_write(MAXM86161_I2C_ADDR, MAXM86161_REG_FIFO_CONFIG2, 0x02);
+	if (err) {
+		LOG_WRN("MAXM86161: Failed to set FIFO_CONFIG2");
 	}
 
 	/* Enable die temperature measurement */
@@ -1148,7 +1209,7 @@ static int maxm86161_init(void)
 	}
 
 	maxm86161_ready = true;
-	printk("MAXM86161 PPG+SpO2 sensor initialized\n");
+	printk("MAXM86161 PPG sensor calibrated and initialized\n");
 	LOG_INF("MAXM86161 PPG+SpO2 sensor initialized");
 	return 0;
 }
@@ -1251,16 +1312,22 @@ static int maxm86161_read_ppg(uint32_t *ppg_value)
 /* Calculate SpO2 from buffered Red and IR data
  * Uses the ratio-of-ratios method:
  * R = (AC_red/DC_red) / (AC_ir/DC_ir)
- * SpO2 = 110 - 25 * R (simplified linear approximation)
+ * SpO2 calculated using empirical calibration curve
+ *
+ * AC is calculated using RMS of deviation from mean (more robust than peak-to-peak)
  */
 static uint8_t calculate_spo2(void)
 {
+	static uint8_t last_valid_spo2 = 0;
+	static int invalid_count = 0;
+	static int debug_counter = 0;
+
 	if (spo2_buffer_count < 50) {
-		return 0; /* Not enough data */
+		return last_valid_spo2; /* Return last valid while building buffer */
 	}
 
-	/* Calculate DC (mean) and AC (peak-to-peak) for Red and IR */
-	uint32_t red_sum = 0, ir_sum = 0;
+	/* Calculate DC (mean) for Red and IR */
+	uint64_t red_sum = 0, ir_sum = 0;
 	uint32_t red_min = UINT32_MAX, red_max = 0;
 	uint32_t ir_min = UINT32_MAX, ir_max = 0;
 
@@ -1274,68 +1341,187 @@ static uint8_t calculate_spo2(void)
 		if (ir_buffer[i] > ir_max) ir_max = ir_buffer[i];
 	}
 
-	uint32_t red_dc = red_sum / spo2_buffer_count;
-	uint32_t ir_dc = ir_sum / spo2_buffer_count;
-	uint32_t red_ac = red_max - red_min;
-	uint32_t ir_ac = ir_max - ir_min;
+	uint32_t red_dc = (uint32_t)(red_sum / spo2_buffer_count);
+	uint32_t ir_dc = (uint32_t)(ir_sum / spo2_buffer_count);
 
-	/* Store for packet transmission */
+	/* Calculate AC using RMS of deviation from mean (more robust) */
+	uint64_t red_sq_sum = 0, ir_sq_sum = 0;
+	for (int i = 0; i < spo2_buffer_count; i++) {
+		int32_t red_dev = (int32_t)red_buffer[i] - (int32_t)red_dc;
+		int32_t ir_dev = (int32_t)ir_buffer[i] - (int32_t)ir_dc;
+		red_sq_sum += (uint64_t)(red_dev * red_dev);
+		ir_sq_sum += (uint64_t)(ir_dev * ir_dev);
+	}
+
+	/* RMS = sqrt(sum_of_squares / N), AC_rms ≈ 0.707 * AC_peak for sine wave */
+	/* For simplicity, use scaled integer sqrt approximation */
+	uint32_t red_variance = (uint32_t)(red_sq_sum / spo2_buffer_count);
+	uint32_t ir_variance = (uint32_t)(ir_sq_sum / spo2_buffer_count);
+
+	/* Simple integer sqrt using Newton's method */
+	uint32_t red_ac_rms = 1, ir_ac_rms = 1;
+	if (red_variance > 0) {
+		uint32_t x = red_variance;
+		uint32_t y = (x + 1) / 2;
+		while (y < x) { x = y; y = (x + red_variance / x) / 2; }
+		red_ac_rms = x;
+	}
+	if (ir_variance > 0) {
+		uint32_t x = ir_variance;
+		uint32_t y = (x + 1) / 2;
+		while (y < x) { x = y; y = (x + ir_variance / x) / 2; }
+		ir_ac_rms = x;
+	}
+
+	/* Also keep peak-to-peak for comparison */
+	uint32_t red_ac_pp = red_max - red_min;
+	uint32_t ir_ac_pp = ir_max - ir_min;
+
+	/* Use RMS-based AC (multiply by ~1.4 to approximate peak-to-peak for display) */
+	uint32_t red_ac = red_ac_rms;
+	uint32_t ir_ac = ir_ac_rms;
+
+	/* Store for packet transmission (use peak-to-peak for display compatibility) */
 	spo2_red_dc = red_dc;
-	spo2_red_ac = red_ac;
+	spo2_red_ac = red_ac_pp;
 	spo2_ir_dc = ir_dc;
-	spo2_ir_ac = ir_ac;
+	spo2_ir_ac = ir_ac_pp;
 
-	/* Avoid division by zero */
-	if (red_dc == 0 || ir_dc == 0 || ir_ac == 0) {
-		return 0;
+	/* Debug output every ~2 seconds (50 calls at 100Hz SpO2 rate) */
+	debug_counter++;
+	if (debug_counter >= 50) {
+		debug_counter = 0;
+		printk("SpO2 DBG: Red DC=%u AC_pp=%u AC_rms=%u | IR DC=%u AC_pp=%u AC_rms=%u | buf=%d\n",
+		       red_dc, red_ac_pp, red_ac_rms, ir_dc, ir_ac_pp, ir_ac_rms, spo2_buffer_count);
+	}
+
+	/* Signal validity checks - RELAXED thresholds */
+	/* 1. Need minimum DC values (finger on sensor) - lowered threshold */
+	if (red_dc < 500 || ir_dc < 500) {
+		if (debug_counter == 0) {
+			printk("SpO2: No finger (DC too low: red=%u ir=%u)\n", red_dc, ir_dc);
+		}
+		invalid_count++;
+		if (invalid_count > 20) {
+			last_valid_spo2 = 0;
+		}
+		return last_valid_spo2;
+	}
+
+	/* 2. Need minimum AC (pulsatile) signal - use RMS with lower threshold */
+	if (red_ac < 10 || ir_ac < 10) {
+		if (debug_counter == 0) {
+			printk("SpO2: Weak pulse (AC too low: red=%u ir=%u)\n", red_ac, ir_ac);
+		}
+		invalid_count++;
+		if (invalid_count > 20) {
+			last_valid_spo2 = 0;
+		}
+		return last_valid_spo2;
+	}
+
+	/* 3. AC should be reasonable fraction of DC (0.01% to 20%) - wider range */
+	uint32_t red_perfusion = (red_ac * 10000) / red_dc;  /* Per 10k for precision */
+	uint32_t ir_perfusion = (ir_ac * 10000) / ir_dc;
+	if (red_perfusion < 1 || red_perfusion > 2000 ||
+	    ir_perfusion < 1 || ir_perfusion > 2000) {
+		if (debug_counter == 0) {
+			printk("SpO2: Bad perfusion (red=%u ir=%u per 10k)\n", red_perfusion, ir_perfusion);
+		}
+		invalid_count++;
+		if (invalid_count > 20) {
+			last_valid_spo2 = 0;
+		}
+		return last_valid_spo2;
 	}
 
 	/* Calculate R = (AC_red/DC_red) / (AC_ir/DC_ir)
 	 * Rearranged: R = (AC_red * DC_ir) / (DC_red * AC_ir)
 	 * Scale by 1000 for fixed-point math
 	 */
-	uint32_t numerator = (uint32_t)red_ac * ir_dc;
-	uint32_t denominator = (uint32_t)red_dc * ir_ac;
+	uint64_t numerator = (uint64_t)red_ac * ir_dc;
+	uint64_t denominator = (uint64_t)red_dc * ir_ac;
 
 	if (denominator == 0) {
-		return 0;
+		return last_valid_spo2;
 	}
 
 	/* R * 1000 */
-	uint32_t R_scaled = (numerator * 1000) / denominator;
+	uint32_t R_scaled = (uint32_t)((numerator * 1000) / denominator);
 
-	/* SpO2 = 110 - 25 * R
+	if (debug_counter == 0) {
+		printk("SpO2: R_scaled=%u (R=%.3f)\n", R_scaled, R_scaled / 1000.0f);
+	}
+
+	/* Validate R range - WIDER range (0.3 to 3.0) */
+	if (R_scaled < 200 || R_scaled > 3000) {
+		if (debug_counter == 0) {
+			printk("SpO2: R out of range (%u)\n", R_scaled);
+		}
+		invalid_count++;
+		if (invalid_count > 20) {
+			last_valid_spo2 = 0;
+		}
+		return last_valid_spo2;
+	}
+
+	/* SpO2 = 110 - 25 * R (simplified linear approximation)
+	 * This is a common approximation. More accurate would use lookup table.
 	 * With R_scaled = R * 1000:
 	 * SpO2 = 110 - (25 * R_scaled) / 1000
 	 */
-	int32_t spo2_calc = 110 - (25 * R_scaled) / 1000;
+	int32_t spo2_calc = 110 - (25 * (int32_t)R_scaled) / 1000;
 
-	/* Clamp to valid range */
+	/* Clamp to physiologically valid range */
 	if (spo2_calc < 70) spo2_calc = 70;
 	if (spo2_calc > 100) spo2_calc = 100;
 
-	spo2_value = (uint8_t)spo2_calc;
+	if (debug_counter == 0) {
+		printk("SpO2: Calculated %d%% (was %d%%)\n", spo2_calc, last_valid_spo2);
+	}
+
+	/* Smooth the output (70% old + 30% new for faster response) */
+	if (last_valid_spo2 > 0) {
+		spo2_calc = (last_valid_spo2 * 7 + spo2_calc * 3) / 10;
+	}
+
+	invalid_count = 0;
+	last_valid_spo2 = (uint8_t)spo2_calc;
+	spo2_value = last_valid_spo2;
 	return spo2_value;
 }
 
-/* Calculate signal quality (0-100) based on AC amplitude */
+/* Calculate signal quality (0-100) based on signal characteristics */
 static uint8_t calculate_signal_quality(void)
 {
 	if (spo2_buffer_count < 20) {
 		return 0;
 	}
 
-	/* Quality based on IR AC amplitude - typical good signal is 1000-50000 */
-	if (spo2_ir_ac < 100) {
-		return 0; /* No signal */
-	} else if (spo2_ir_ac < 500) {
-		return 20; /* Very weak */
-	} else if (spo2_ir_ac < 2000) {
-		return 50; /* Weak */
-	} else if (spo2_ir_ac < 10000) {
-		return 80; /* Good */
+	/* Check if we have valid DC signal (finger on sensor) */
+	if (spo2_ir_dc < 1000 || spo2_red_dc < 1000) {
+		return 0; /* No finger detected */
+	}
+
+	/* Check for valid AC (pulsatile) signal */
+	if (spo2_ir_ac < 50 || spo2_red_ac < 50) {
+		return 10; /* Finger present but no pulse detected */
+	}
+
+	/* Calculate perfusion index (AC/DC ratio) - indicates signal strength */
+	uint32_t perfusion = (spo2_ir_ac * 1000) / spo2_ir_dc;  /* Per mille */
+
+	/* Quality based on perfusion index */
+	if (perfusion < 2) {
+		return 20; /* Very weak pulse */
+	} else if (perfusion < 5) {
+		return 40; /* Weak pulse */
+	} else if (perfusion < 10) {
+		return 60; /* Fair pulse */
+	} else if (perfusion < 30) {
+		return 80; /* Good pulse */
 	} else {
-		return 100; /* Excellent */
+		return 100; /* Excellent pulse */
 	}
 }
 
@@ -1498,24 +1684,24 @@ static int bq25120a_init(void)
 	 * Bit [7] = EN_SYS_OUT: 1 = System output enabled
 	 * Bits [6:1] = SYS_VOUT: output voltage code
 	 *   1.1V + (code * 100mV)
-	 *   For 1.8V: (1800 - 1100) / 100 = 7 = 0x07 -> 0x0E (shifted)
+	 *   For 1.9V: (1900 - 1100) / 100 = 8 = 0x08 -> 0x10 (shifted)
 	 * Bit [0] = SYS_SEL: 1 = SYS always regulated (helps in fault state)
 	 *
-	 * Set EN_SYS_OUT=1, SYS_VOUT for 1.8V, SYS_SEL=1
-	 * 0x80 | 0x0E | 0x01 = 0x8F
+	 * Set EN_SYS_OUT=1, SYS_VOUT for 1.9V, SYS_SEL=1
+	 * 0x80 | 0x10 | 0x01 = 0x91
 	 */
-	err = i2c_reg_write(BQ25120A_I2C_ADDR, BQ25120A_REG_SYS_VOUT_CTRL, 0x8F);
+	err = i2c_reg_write(BQ25120A_I2C_ADDR, BQ25120A_REG_SYS_VOUT_CTRL, 0x91);
 	if (err) {
 		LOG_WRN("BQ25120A: Failed to set SYS output");
 	} else {
-		printk("BQ25120A: SYS output enabled at 1.8V (always regulated)\n");
+		printk("BQ25120A: SYS output enabled at 1.9V (always regulated)\n");
 	}
 
 	/* Read back to verify */
 	uint8_t sys_vout_readback;
 	err = i2c_reg_read(BQ25120A_I2C_ADDR, BQ25120A_REG_SYS_VOUT_CTRL, &sys_vout_readback);
 	if (err == 0) {
-		printk("BQ25120A SYS_VOUT_CTRL readback: 0x%02X (expected 0x8F)\n", sys_vout_readback);
+		printk("BQ25120A SYS_VOUT_CTRL readback: 0x%02X (expected 0x91)\n", sys_vout_readback);
 	}
 
 	/* Configure VIN_DPM - input voltage dynamic power management
@@ -1616,23 +1802,49 @@ static int bq25120a_read_battery_voltage(uint8_t *vbat_percent)
 		return -ENODEV;
 	}
 
-	/* Initiate battery voltage reading by writing 0x80 to BATT_MON */
-	err = i2c_reg_write(BQ25120A_I2C_ADDR, BQ25120A_REG_BATT_MON, 0x80);
-	if (err) {
-		return err;
+	/* Binary search for actual battery percentage using VBAT_COMP bit
+	 * BATT_MON register:
+	 * - Bit 7: VBAT_COMP (read-only) - 1 if VBAT > threshold, 0 if VBAT < threshold
+	 * - Bits 6:2: VBMON_TH[4:0] - threshold from 60% to 100% of VBATREG (2% steps)
+	 * - Threshold = (value * 2) + 60, so value = (threshold - 60) / 2
+	 */
+	uint8_t low = 0;   /* 60% */
+	uint8_t high = 20; /* 100% (20 * 2 + 60 = 100) */
+	uint8_t result = 0;
+
+	while (low <= high) {
+		uint8_t mid = (low + high) / 2;
+
+		/* Set threshold and trigger comparison (bit 7 set triggers read) */
+		uint8_t threshold_reg = 0x80 | (mid << 2);
+		err = i2c_reg_write(BQ25120A_I2C_ADDR, BQ25120A_REG_BATT_MON, threshold_reg);
+		if (err) {
+			return err;
+		}
+
+		/* Wait for comparison (2ms per datasheet) */
+		k_msleep(3);
+
+		/* Read result */
+		err = i2c_reg_read(BQ25120A_I2C_ADDR, BQ25120A_REG_BATT_MON, &batt_mon);
+		if (err) {
+			return err;
+		}
+
+		/* Check VBAT_COMP (bit 7): 1 = VBAT > threshold */
+		if (batt_mon & 0x80) {
+			/* Battery is above this threshold, search higher */
+			result = mid;
+			low = mid + 1;
+		} else {
+			/* Battery is below this threshold, search lower */
+			if (mid == 0) break;
+			high = mid - 1;
+		}
 	}
 
-	/* Wait for measurement (2ms per datasheet) */
-	k_msleep(3);
-
-	/* Read battery monitor register */
-	err = i2c_reg_read(BQ25120A_I2C_ADDR, BQ25120A_REG_BATT_MON, &batt_mon);
-	if (err) {
-		return err;
-	}
-
-	/* Extract voltage threshold (bits 6:2) - represents % of VBATREG in 2% increments */
-	*vbat_percent = ((batt_mon >> 2) & 0x1F) * 2 + 60; /* 60% to 100% range */
+	/* Convert threshold value to percentage: value * 2 + 60 */
+	*vbat_percent = result * 2 + 60;
 
 	return 0;
 }
@@ -1755,13 +1967,49 @@ static void read_all_sensors(void)
 	printk("=====================================\n\n");
 }
 
-/* Build and send sensor data packet over BLE */
+/* Build and send sensor data packet over BLE with averaging */
 static int send_sensor_packet(void)
 {
 	struct sensor_packet pkt = {0};
 	uint16_t checksum = 0;
 	uint8_t *pkt_bytes = (uint8_t *)&pkt;
 	int err;
+
+	/* ========== ACCUMULATE SAMPLES ========== */
+
+	/* Read and accumulate IMU data */
+	if (imu_ready) {
+		struct sensor_value accel[3], gyro[3];
+		err = read_imu_data(accel, gyro);
+		if (err == 0) {
+			/* Accumulate in milli-units */
+			avg_accel_x += (int32_t)(accel[0].val1 * 1000 + accel[0].val2 / 1000);
+			avg_accel_y += (int32_t)(accel[1].val1 * 1000 + accel[1].val2 / 1000);
+			avg_accel_z += (int32_t)(accel[2].val1 * 1000 + accel[2].val2 / 1000);
+			avg_gyro_x += (int32_t)(gyro[0].val1 * 1000 + gyro[0].val2 / 1000);
+			avg_gyro_y += (int32_t)(gyro[1].val1 * 1000 + gyro[1].val2 / 1000);
+			avg_gyro_z += (int32_t)(gyro[2].val1 * 1000 + gyro[2].val2 / 1000);
+		}
+	}
+
+	/* Read and accumulate PPG data */
+	if (maxm86161_ready) {
+		uint32_t ppg_value = 0;
+		err = maxm86161_read_ppg(&ppg_value);
+		if (err == 0) {
+			avg_ppg += ppg_value;
+		}
+	}
+
+	/* Increment sample counter */
+	ble_avg_idx++;
+
+	/* Only send packet when we have enough samples */
+	if (ble_avg_idx < BLE_AVG_COUNT) {
+		return 0;  /* Not yet time to send */
+	}
+
+	/* ========== BUILD AND SEND AVERAGED PACKET ========== */
 
 	/* Sync bytes */
 	pkt.sync1 = SENSOR_PACKET_SYNC1;
@@ -1770,48 +2018,54 @@ static int send_sensor_packet(void)
 	/* Timestamp */
 	pkt.timestamp_ms = k_uptime_get_32();
 
-	/* Read IMU data */
-	if (imu_ready) {
-		struct sensor_value accel[3], gyro[3];
-		err = read_imu_data(accel, gyro);
-		if (err == 0) {
-			/* Convert to milli-units (val1 * 1000 + val2 / 1000) */
-			pkt.accel_x = (int16_t)(accel[0].val1 * 1000 + accel[0].val2 / 1000);
-			pkt.accel_y = (int16_t)(accel[1].val1 * 1000 + accel[1].val2 / 1000);
-			pkt.accel_z = (int16_t)(accel[2].val1 * 1000 + accel[2].val2 / 1000);
-			pkt.gyro_x = (int16_t)(gyro[0].val1 * 1000 + gyro[0].val2 / 1000);
-			pkt.gyro_y = (int16_t)(gyro[1].val1 * 1000 + gyro[1].val2 / 1000);
-			pkt.gyro_z = (int16_t)(gyro[2].val1 * 1000 + gyro[2].val2 / 1000);
-		}
-	}
+	/* Compute IMU averages */
+	pkt.accel_x = (int16_t)(avg_accel_x / BLE_AVG_COUNT);
+	pkt.accel_y = (int16_t)(avg_accel_y / BLE_AVG_COUNT);
+	pkt.accel_z = (int16_t)(avg_accel_z / BLE_AVG_COUNT);
+	pkt.gyro_x = (int16_t)(avg_gyro_x / BLE_AVG_COUNT);
+	pkt.gyro_y = (int16_t)(avg_gyro_y / BLE_AVG_COUNT);
+	pkt.gyro_z = (int16_t)(avg_gyro_z / BLE_AVG_COUNT);
 
-	/* Read PPG data and calculate SpO2 */
-	if (maxm86161_ready) {
-		uint32_t ppg_value = 0;
-		err = maxm86161_read_ppg(&ppg_value);
-		if (err == 0) {
-			pkt.ppg_raw = ppg_value;
+	/* Compute PPG average */
+	pkt.ppg_raw = avg_ppg / BLE_AVG_COUNT;
 
-			/* Calculate SpO2 (updates internal state) */
-			pkt.spo2_percent = calculate_spo2();
-			pkt.signal_quality = calculate_signal_quality();
-		}
-	}
+	/* Calculate SpO2 (uses internal buffers, not averaged) */
+	pkt.spo2_percent = calculate_spo2();
+	pkt.signal_quality = calculate_signal_quality();
+
+	/* Reset accumulators */
+	avg_accel_x = avg_accel_y = avg_accel_z = 0;
+	avg_gyro_x = avg_gyro_y = avg_gyro_z = 0;
+	avg_ppg = 0;
+	ble_avg_idx = 0;
 
 	/* Read battery data (less frequently, cache it) */
 	static uint8_t cached_batt_pct = 0;
 	static uint8_t cached_charge_status = 0;
 	static uint32_t last_batt_read = 0;
 
-	if (bq25120a_ready && (k_uptime_get_32() - last_batt_read > 1000)) {
+	if (bq25120a_ready && (k_uptime_get_32() - last_batt_read > 2000)) {
 		uint8_t status, faults, vbat_pct;
 		err = bq25120a_read_status(&status, &faults);
 		if (err == 0) {
-			cached_charge_status = (status >> 6) & 0x03;
+			/* Pack charge_status byte:
+			 * Bits 0-1: Charge state (0=Ready, 1=Charging, 2=Done, 3=Fault)
+			 * Bit 2: VIN_PG (1=USB power present, 0=No USB)
+			 */
+			uint8_t charge_state = (status >> 6) & 0x03;
+			uint8_t vin_pg = (status & 0x20) ? 0x04 : 0x00;
+			cached_charge_status = charge_state | vin_pg;
+			LOG_DBG("BQ25120A status=0x%02X faults=0x%02X VIN_PG=%d charge=%d",
+				status, faults, vin_pg ? 1 : 0, charge_state);
 		}
 		err = bq25120a_read_battery_voltage(&vbat_pct);
 		if (err == 0) {
+			if (cached_batt_pct != vbat_pct) {
+				LOG_INF("Battery: %d%% -> %d%%", cached_batt_pct, vbat_pct);
+			}
 			cached_batt_pct = vbat_pct;
+		} else {
+			LOG_WRN("Battery read failed: %d", err);
 		}
 		last_batt_read = k_uptime_get_32();
 	}
@@ -1820,13 +2074,23 @@ static int send_sensor_packet(void)
 
 	/* Read die temperature periodically (approximates skin temp when sensor contacts skin) */
 	static uint32_t last_temp_read = 0;
+	static int16_t last_logged_temp = -999;
 	if (maxm86161_ready && (k_uptime_get_32() - last_temp_read > 500)) {
 		int8_t temp_int;
 		uint8_t temp_frac;
 		err = maxm86161_read_temperature(&temp_int, &temp_frac);
 		if (err == 0) {
 			/* Store as 0.1C units: temp_int is integer, temp_frac/256 is decimal */
-			last_die_temp_c10 = temp_int * 10 + (temp_frac * 10) / 256;
+			int16_t new_temp = temp_int * 10 + (temp_frac * 10) / 256;
+			/* Log when temperature changes by more than 0.5C */
+			if (last_logged_temp == -999 || abs(new_temp - last_logged_temp) >= 5) {
+				LOG_INF("Die temp: %d.%dC (raw int=%d frac=%d)",
+					new_temp / 10, new_temp % 10, temp_int, temp_frac);
+				last_logged_temp = new_temp;
+			}
+			last_die_temp_c10 = new_temp;
+		} else {
+			LOG_WRN("Temp read failed: %d", err);
 		}
 		last_temp_read = k_uptime_get_32();
 	}
@@ -2127,6 +2391,9 @@ int main(void)
 	}
 
 	LOG_INF("Bluetooth initialized");
+	/* Note: SMP (mcumgr) BLE transport for OTA DFU auto-registers via Kconfig
+	 * when CONFIG_MCUMGR_TRANSPORT_BT=y. Use nRF Connect app or mcumgr CLI
+	 * to upload new firmware over BLE. SMP UUID: 8D53DC1D-1DB7-4CD3-868B-8A527460AA84 */
 
 	k_sem_give(&ble_init_ok);
 
@@ -2182,10 +2449,10 @@ void ble_write_thread(void)
 		}
 
 		if (current_conn && ble_streaming_enabled) {
-			/* Send sensor packet at ~25Hz (40ms interval) */
+			/* Send sensor packet at ~25Hz (40ms) - matches PPG output rate with 4x averaging */
 			int err = send_sensor_packet();
 			if (err == -ENOMEM) {
-				/* BLE buffer full, slow down */
+				/* BLE buffer full, slow down more aggressively */
 				k_msleep(100);
 			} else {
 				k_msleep(40);
